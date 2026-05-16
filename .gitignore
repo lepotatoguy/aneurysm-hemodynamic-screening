@@ -4,3 +4,9 @@
 dataset/
 data/
 *tar
+.DS_Store
+*.log
+*.out
+*.err
+.vscode/
+AneuriskDatabase/
