@@ -312,20 +312,34 @@ def auto_generate_pr2(mesh_path, pr2_path):
 
 # ── Shell execution (unchanged) ───────────────────────────────────────────────
 
+# def run_cmd(cmd, step_name):
+#     """Executes a shell command with full stdout/stderr capture on failure."""
+#     logging.info(f"Starting: {step_name}")
+#     try:
+#         subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+#         logging.info(f"Success: {step_name}")
+#     except subprocess.CalledProcessError as e:
+#         stdout_msg = e.stdout.decode('utf-8') if e.stdout else "None"
+#         stderr_msg = e.stderr.decode('utf-8') if e.stderr else "None"
+#         logging.error(
+#             f"FAILED: {step_name}\n\n"
+#             f"[STANDARD ERROR]:\n{stderr_msg}\n\n"
+#             f"[STANDARD OUTPUT]:\n{stdout_msg}"
+#         )
+#         raise
+
 def run_cmd(cmd, step_name):
-    """Executes a shell command with full stdout/stderr capture on failure."""
+    """Executes a shell command, streaming output live. Captures stderr for error reporting."""
     logging.info(f"Starting: {step_name}")
     try:
-        subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(
+            cmd, shell=True, check=True,
+            stderr=subprocess.PIPE   # Capture stderr only; stdout streams live to terminal
+        )
         logging.info(f"Success: {step_name}")
     except subprocess.CalledProcessError as e:
-        stdout_msg = e.stdout.decode('utf-8') if e.stdout else "None"
         stderr_msg = e.stderr.decode('utf-8') if e.stderr else "None"
-        logging.error(
-            f"FAILED: {step_name}\n\n"
-            f"[STANDARD ERROR]:\n{stderr_msg}\n\n"
-            f"[STANDARD OUTPUT]:\n{stdout_msg}"
-        )
+        logging.error(f"FAILED: {step_name}\n\n[STANDARD ERROR]:\n{stderr_msg}")
         raise
 
 
@@ -775,10 +789,39 @@ def log_exclusion(patient_id, reason, metric_name, metric_value):
 
 # ── Patient processing (steps 1-6 unchanged, 7-8 added) ──────────────────────
 
+# def _detect_resume_step(patient_id, patient_pr2, patient_gmy, patient_xml,
+#                          patient_out_dir):
+#     """
+#     Detect which pipeline step to resume from for a given patient.
+
+#     Returns
+#     -------
+#     int : step number to start from (1-7). Steps before this are already complete.
+#     """
+#     csv_path = patient_out_dir / f"{patient_id}_fluid_data.csv"
+
+#     if csv_path.exists():
+#         return 7   # CSV exists: skip to quality checks
+#     if (patient_out_dir / "Extracted" / "whole.xtr").exists() or        list(patient_out_dir.glob("**/whole.xtr")):
+#         return 6   # .xtr exists: skip to CSV extraction
+#     if patient_out_dir.exists() and any(patient_out_dir.iterdir()):
+#         return 5   # Output dir has content: simulation already ran, something went wrong
+#     if patient_xml.exists() and patient_gmy.exists():
+#         return 5   # GMY + XML ready: skip to simulation
+#     if patient_gmy.exists():
+#         return 3   # GMY exists: skip to XML patching
+#     if patient_pr2.exists():
+#         return 2   # PR2 exists: skip to voxelization
+#     return 1       # Start from scratch
+
 def _detect_resume_step(patient_id, patient_pr2, patient_gmy, patient_xml,
-                         patient_out_dir):
+                        patient_out_dir):
     """
     Detect which pipeline step to resume from for a given patient.
+
+    Partial simulation outputs (output dir exists but no CSV) are treated as
+    corrupt and deleted automatically. This handles the case where the pipeline
+    was interrupted mid-simulation.
 
     Returns
     -------
@@ -786,19 +829,57 @@ def _detect_resume_step(patient_id, patient_pr2, patient_gmy, patient_xml,
     """
     csv_path = patient_out_dir / f"{patient_id}_fluid_data.csv"
 
+    
+    # CSV exists: verify it is complete before trusting it
     if csv_path.exists():
-        return 7   # CSV exists: skip to quality checks
-    if (patient_out_dir / "Extracted" / "whole.xtr").exists() or        list(patient_out_dir.glob("**/whole.xtr")):
-        return 6   # .xtr exists: skip to CSV extraction
-    if patient_out_dir.exists() and any(patient_out_dir.iterdir()):
-        return 5   # Output dir has content: simulation already ran, something went wrong
+        try:
+            with open(csv_path, 'r') as f:
+                content = f.read()
+            ts_count = content.count('# Timestep')
+            if ts_count < 10: #because it should have from 0 to 20000 with steps of 2000, so 10 blocks in total
+                logging.warning(
+                    f"  {patient_id}: CSV exists but has only {ts_count}/10 "
+                    f"timestep blocks. File is incomplete. Deleting and rerunning."
+                )
+                csv_path.unlink()
+                # Output dir may still exist with the .xtr - delete it too
+                if patient_out_dir.exists():
+                    shutil.rmtree(patient_out_dir)
+                # Fall through to GMY/XML check below
+            else:
+                return 7   # CSV exists: fully complete, only quality checks remain
+        except Exception as e:
+            logging.warning(
+                f"  {patient_id}: CSV validation failed ({e}). Deleting and rerunning."
+            )
+            csv_path.unlink()
+            if patient_out_dir.exists():
+                shutil.rmtree(patient_out_dir)
+
+    # Output directory exists but no CSV: interrupted mid-simulation or mid-extraction.
+    # Delete the partial output and rerun from simulation step.
+    if patient_out_dir.exists():
+        logging.warning(
+            f"  {patient_id}: output directory exists but no CSV found. "
+            f"Previous run was interrupted. Deleting partial output and rerunning simulation."
+        )
+        shutil.rmtree(patient_out_dir)
+        # Fall through to check if GMY + XML are ready
+
+    # GMY and XML both exist: ready to simulate
     if patient_xml.exists() and patient_gmy.exists():
-        return 5   # GMY + XML ready: skip to simulation
+        return 5
+
+    # GMY exists but XML missing: redo XML patching
     if patient_gmy.exists():
-        return 3   # GMY exists: skip to XML patching
+        return 3
+
+    # PR2 exists: redo voxelization
     if patient_pr2.exists():
-        return 2   # PR2 exists: skip to voxelization
-    return 1       # Start from scratch
+        return 2
+
+    # Nothing exists: full run
+    return 1
 
 
 def process_patient(mesh_file, start_from=None):
