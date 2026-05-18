@@ -48,3 +48,6 @@ AneuriskDatabase/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+*.png
+*.gif
