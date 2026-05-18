@@ -101,6 +101,68 @@ def patient_label(pid, info):
 
 # ── Data loaders ──────────────────────────────────────────────────────────────
 
+def load_pr2_iolets(patient_id):
+    """
+    Parse inlet/outlet centre positions and types from the .pr2 file.
+    Returns list of dicts: {type, centre_m, normal, radius_m, name}
+    """
+    pr2_path = RAW_DIR / f"{patient_id}.pr2"
+    if not pr2_path.exists():
+        return []
+
+    TOP = {'OutputGeometryFile','OutputXmlFile','SeedPoint','StlFile',
+           'StlFileUnitId','TimeStepSeconds','VoxelSize','DurationSeconds'}
+    iolets, current, sub, active = [], None, None, False
+
+    with open(pr2_path) as f:
+        for line in f:
+            s = line.strip()
+            if not s: continue
+            if s == 'Iolets:':
+                active = True; continue
+            if not active: continue
+            if s.split(':')[0].strip() in TOP:
+                if current: iolets.append(current)
+                current = None; active = False; continue
+            if s == '- Centre:':
+                if current: iolets.append(current)
+                current = {'centre':[0.,0.,0.],'normal':[0.,0.,0.],
+                           'radius':0.,'type':None}
+                sub = 'centre'; continue
+            if s == 'Normal:': sub = 'normal'; continue
+            if s in ('Pressure:','Centre:') or s.startswith('Name:'):
+                sub = None; continue
+            if s.startswith('Radius:') and current:
+                current['radius'] = float(s.split(':',1)[1].strip()); sub = None; continue
+            if s.startswith('Type:') and current:
+                current['type'] = s.split(':',1)[1].strip(); sub = None; continue
+            if sub in ('centre','normal') and current:
+                if   s.startswith('x:'): current[sub][0] = float(s[2:].strip())
+                elif s.startswith('y:'): current[sub][1] = float(s[2:].strip())
+                elif s.startswith('z:'): current[sub][2] = float(s[2:].strip())
+
+    if current: iolets.append(current)
+
+    # Convert mm -> m and normalise normals
+    result = []
+    inlet_n = outlet_n = 1
+    for io in iolets:
+        centre_m = np.array(io['centre']) / 1000.0
+        normal   = np.array(io['normal'], dtype=np.float64)
+        norm_mag = np.linalg.norm(normal)
+        if norm_mag > 1e-10: normal = normal / norm_mag
+        name = (f"Inlet {inlet_n}"  if io['type'] == 'Inlet'
+                else f"Outlet {outlet_n}")
+        if io['type'] == 'Inlet':  inlet_n  += 1
+        else:                       outlet_n += 1
+        result.append({'type'    : io['type'],
+                       'centre_m': centre_m,
+                       'normal'  : normal,
+                       'radius_m': io['radius'] / 1000.0,
+                       'name'    : name})
+    return result
+
+
 def load_wss_csv(patient_id):
     path = WSS_DIR / f"{patient_id}_wss.csv"
     if not path.exists():
@@ -276,6 +338,53 @@ def view_wss(patient_ids):
         add_stats_text(pl, pid, wss_vals, status, loc, age, sex)
 
         # Orientation cube + zoom slider + screenshot
+        # ── Inlet/Outlet toggle ───────────────────────────────────────────────
+        iolets_info_wss  = load_pr2_iolets(pid)
+        iolet_actors_wss = {'objs': []}
+
+        def make_iolet_toggle(info_list, actors_dict, _pl=pl):
+            def toggle(state):
+                if not state:
+                    for a in actors_dict['objs']:
+                        _pl.remove_actor(a)
+                    actors_dict['objs'] = []
+                else:
+                    for io in info_list:
+                        colour = '#ff4444' if io['type'] == 'Inlet' else '#4488ff'
+                        sphere = pv.Sphere(radius=io['radius_m']*0.35,
+                                           center=io['centre_m'])
+                        disc   = pv.Disc(center=io['centre_m'],
+                                         normal=io['normal'].tolist(),
+                                         inner=0.0,
+                                         outer=io['radius_m']*0.9,
+                                         r_res=2, c_res=30)
+                        a1 = _pl.add_mesh(sphere, color=colour, opacity=0.85)
+                        a2 = _pl.add_mesh(disc,   color=colour, opacity=0.40)
+                        a3 = _pl.add_point_labels(
+                            [io['centre_m']], [io['name']],
+                            font_size=10, text_color=colour,
+                            shape_color='black', shape_opacity=0.5,
+                            show_points=False,
+                        )
+                        actors_dict['objs'].extend([a1, a2, a3])
+            return toggle
+
+        win_h_wss = pl.window_size[1]
+        y0_wss    = 0.80
+        bh_wss    = 0.058
+        bsize_wss = 24
+        n_existing_buttons = 5   # WSS Pa, nWSS, log, LowWSS, Focus Peak
+        ypos_io = int(win_h_wss * (y0_wss - n_existing_buttons * bh_wss))
+
+        pl.add_checkbox_button_widget(
+            make_iolet_toggle(iolets_info_wss, iolet_actors_wss),
+            value=False,
+            position=(10, ypos_io), size=bsize_wss,
+            color_on='#44aaff', color_off='#444444',
+        )
+        pl.add_text('Inlet/Outlets', position=(42, ypos_io+4),
+                    font_size=8, color='white')
+
         pl.add_camera_orientation_widget()
         add_zoom_slider(pl)
         add_screenshot_key(pl, prefix=f"wss_{pid}")
@@ -420,9 +529,23 @@ def view_flow(patient_id, subsample=25):
         sc    = show_state['scalar']
         clim  = [0, vmax_spd] if sc == 'speed' else [vmin_pres, vmax_pres]
         cmap  = FLOW_CMAP if sc == 'speed' else 'coolwarm'
+        sbar_title = 'Speed (m/s)' if sc == 'speed' else 'Pressure (Pa)'
         pl.add_mesh(pc, scalars=sc, cmap=cmap, clim=clim,
                     point_size=3, render_points_as_spheres=True,
-                    show_scalar_bar=False, name='fluid_nodes')
+                    show_scalar_bar=True,
+                    scalar_bar_args={
+                        'title'          : sbar_title,
+                        'color'          : 'white',
+                        'title_font_size': 12,
+                        'label_font_size': 10,
+                        'position_x'     : 0.05,
+                        'position_y'     : 0.06,
+                        'width'          : 0.32,
+                        'height'         : 0.055,
+                        'n_labels'       : 5,
+                        'fmt'            : '%.3e',
+                    },
+                    name='fluid_nodes')
         pl.add_text(info_str(ts), position='upper_left',
                     font_size=8, color='white', font='courier', name='info')
         if show_state['arrows']:
@@ -479,18 +602,58 @@ def view_flow(patient_id, subsample=25):
     pl.add_text('Vel arrows', position=(42, int(win_h*(y0-bh))+4),
                 font_size=8, color='white')
 
+    # ── Inlet/Outlet toggle button ────────────────────────────────────────────
+    iolets_info   = load_pr2_iolets(patient_id)
+    iolet_actors  = {'objs': []}
+
+    def toggle_iolets(state):
+        if not state:
+            for actor in iolet_actors['objs']:
+                pl.remove_actor(actor)
+            iolet_actors['objs'] = []
+        else:
+            for io in iolets_info:
+                colour = '#ff4444' if io['type'] == 'Inlet' else '#4488ff'
+                sphere = pv.Sphere(radius=io['radius_m'] * 0.35,
+                                   center=io['centre_m'])
+                disc   = pv.Disc(center=io['centre_m'],
+                                 normal=io['normal'].tolist(),
+                                 inner=0.0,
+                                 outer=io['radius_m'] * 0.9,
+                                 r_res=2, c_res=30)
+                a1 = pl.add_mesh(sphere, color=colour, opacity=0.85)
+                a2 = pl.add_mesh(disc,   color=colour, opacity=0.40)
+                a3 = pl.add_point_labels(
+                    [io['centre_m']],
+                    [io['name']],
+                    font_size=10,
+                    text_color=colour,
+                    shape_color='black',
+                    shape_opacity=0.5,
+                    show_points=False,
+                )
+                iolet_actors['objs'].extend([a1, a2, a3])
+
+    pl.add_checkbox_button_widget(
+        toggle_iolets, value=False,
+        position=(10, int(win_h*(y0 - 2*bh))), size=bsize,
+        color_on='#44aaff', color_off='#444444',
+    )
+    pl.add_text('Inlet/Outlets', position=(42, int(win_h*(y0-2*bh))+4),
+                font_size=8, color='white')
+
     pl.add_camera_orientation_widget()
     add_zoom_slider(pl)
     add_screenshot_key(pl, prefix=f"flow_{patient_id}")
     pl.add_axes(color='white')
     pl.add_title(
-        f"Flow: {patient_id}  |  Slider=timestep  Buttons=Pressure/Arrows  "
+        f"Flow: {patient_id}  |  Slider=timestep  Buttons=Pressure/Arrows/Iolets  "
         f"Right=zoom  'p'=screenshot  'c'=clip",
         font_size=8, color='#999999')
 
     print("\nFlow viewer ready.")
     print("  Bottom slider: scrub through timesteps")
-    print("  Buttons: Pressure toggle | Velocity arrows")
+    print("  Buttons: Pressure | Velocity arrows | Inlet/Outlets")
     print("  Right slider: zoom")
     pl.show(cpos='iso')
 
