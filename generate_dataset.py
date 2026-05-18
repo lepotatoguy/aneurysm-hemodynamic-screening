@@ -18,9 +18,14 @@ Cases failing checks 7 or 8 are logged to data/excluded_cases.csv and excluded
 from training. Their CSV output is preserved for inspection.
 
 Boundary conditions (fixed throughout project, do not change):
-  Inlet  pressure: 0.1 mmHg
-  Outlet pressure: 0.0 mmHg
+  Inlet : velocity parabolic BC, maximum velocity 0.05 m/s (Ma < 0.1)
+  Outlet: pressure cosine BC, 0.0 mmHg
   VoxelSize: 0.2 mm | TimeStepSeconds: 2e-4 s | Steps: 20000
+
+  The pr2 file retains pressure inlet syntax for hlb-gmy-cli compatibility.
+  The inlet condition is replaced with velocity parabolic during XML patching (Step 3).
+  Parabolic profile: v(r) = v_max*(1 - r^2/R^2); mean velocity = v_max/2 = 0.025 m/s.
+  At dx=0.2mm, dt=2e-4s: c_s = 0.577 m/s, Ma = 0.087 < 0.1 limit.
 
 Inlet detection:
   Uses centerlines.csv (VMTK MaximumInscribedSphereRadius) from AneuriskDatabase
@@ -45,7 +50,8 @@ from pathlib import Path
 from scipy.spatial import KDTree
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-HEMELB_BIN     = "hemelb"
+# HEMELB_BIN     = "hemelb"
+HEMELB_BIN = "/Users/joyantamondal/Downloads/hemelb/build/hemelb-prefix/src/hemelb-build/hemelb"
 SETUP_TOOL_BIN = "hlb-gmy-cli"
 HLB_DUMP_BIN   = "hlb-dump-extracted-properties"
 MPI_CORES      = 4
@@ -62,6 +68,10 @@ MASS_CONSERVATION_THRESHOLD = 0.02   # Max relative flux imbalance across all io
 
 # Exclusion log path
 EXCLUSION_LOG = BASE_DIR / "data" / "excluded_cases.csv"
+
+# Inlet velocity BC
+INLET_MAX_VELOCITY  = 0.05    # m/s, peak parabolic velocity. Ma = 0.087 < 0.1 limit.
+                               # Mean velocity = v_max / 2 = 0.025 m/s.
 
 # Regex for extracting floats/ints from text lines
 NUM_PATTERN = re.compile(r'[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?')
@@ -151,9 +161,10 @@ def auto_generate_pr2(mesh_path, pr2_path):
        largest MaximumInscribedSphereRadius is the parent vessel (inlet).
     2. Largest-loop fallback: used only when centerlines.csv is absent. Logs a warning.
 
-    Boundary conditions (fixed for the entire project):
-      Inlet  pressure: 0.1 mmHg
-      Outlet pressure: 0.0 mmHg
+    Boundary conditions:
+      pr2 uses pressure inlet syntax for hlb-gmy-cli compatibility only.
+      Step 3 (XML patching) replaces inlet with velocity parabolic BC (v_max=0.05 m/s).
+      Outlet: pressure cosine BC, 0.0 mmHg (unchanged).
     """
     patient_id = mesh_path.stem
     logging.info(f"Generating PR2 for: {mesh_path.name}")
@@ -313,19 +324,17 @@ def auto_generate_pr2(mesh_path, pr2_path):
 # ── Shell execution (unchanged) ───────────────────────────────────────────────
 
 def run_cmd(cmd, step_name):
-    """Executes a shell command with full stdout/stderr capture on failure."""
+    """Executes a shell command, streaming stdout live. Captures stderr for error reporting."""
     logging.info(f"Starting: {step_name}")
     try:
-        subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(
+            cmd, shell=True, check=True,
+            stderr=subprocess.PIPE   # stdout streams live to terminal
+        )
         logging.info(f"Success: {step_name}")
     except subprocess.CalledProcessError as e:
-        stdout_msg = e.stdout.decode('utf-8') if e.stdout else "None"
         stderr_msg = e.stderr.decode('utf-8') if e.stderr else "None"
-        logging.error(
-            f"FAILED: {step_name}\n\n"
-            f"[STANDARD ERROR]:\n{stderr_msg}\n\n"
-            f"[STANDARD OUTPUT]:\n{stdout_msg}"
-        )
+        logging.error(f"FAILED: {step_name}\n\n[STANDARD ERROR]:\n{stderr_msg}")
         raise
 
 
@@ -705,15 +714,15 @@ def check_mass_conservation(csv_path, pr2_path, threshold=MASS_CONSERVATION_THRE
 
     if inlet_flux is None:
         logging.warning("  Mass conservation: inlet flux not computed. Cannot perform check.")
-        return True, 0.0
-
+        return True, 0.0   # Cannot check; do not exclude
+    
     # If any iolet had no detectable nodes, skip rather than falsely exclude
     total_iolets    = len(iolets)
     detected_iolets = len(fluxes)
     if detected_iolets < total_iolets:
         logging.warning(
-            f"  Mass conservation: only {detected_iolets}/{total_iolets} iolets detected "
-            f"at 3.0-voxel search radius. Skipping check to avoid false exclusion."
+            f"  Mass conservation: only {detected_iolets}/{total_iolets} iolets detected. "
+            f"Skipping check to avoid false exclusion."
         )
         return True, 0.0
 
@@ -723,15 +732,15 @@ def check_mass_conservation(csv_path, pr2_path, threshold=MASS_CONSERVATION_THRE
 
     net_flux  = inlet_flux + outlet_flux
     rel_error = abs(net_flux) / abs(inlet_flux)
+    passed    = rel_error < threshold
 
     logging.info(
         f"  Mass conservation: net_flux={net_flux:.4e} m^3/s | "
-        f"rel_error={rel_error:.4e} (logged only, not used for exclusion)"
+        f"rel_error={rel_error:.4e} (threshold {threshold:.2e}) "
+        f"-> {'PASS' if passed else 'FAIL'}"
     )
 
-    # Pressure BCs in HemeLB do not guarantee flux balance at measurement planes.
-    # Convergence check is the reliable quality metric. Log only, never exclude.
-    return True, rel_error
+    return passed, rel_error
 
 
 # ── Exclusion logger (new) ────────────────────────────────────────────────────
@@ -767,29 +776,75 @@ def log_exclusion(patient_id, reason, metric_name, metric_value):
 # ── Patient processing (steps 1-6 unchanged, 7-8 added) ──────────────────────
 
 def _detect_resume_step(patient_id, patient_pr2, patient_gmy, patient_xml,
-                         patient_out_dir):
+                        patient_out_dir):
     """
     Detect which pipeline step to resume from for a given patient.
 
+    State machine (checked in priority order):
+      csv complete (10 timestep blocks) -> 7 (quality checks)
+      csv incomplete                    -> delete + rerun
+      output dir without csv            -> delete (partial run) + fall through
+      patched xml + gmy                 -> 5 (simulate)
+      raw xml (RAW_DIR) + gmy           -> 3 (patch xml)
+      gmy only (no xml anywhere)        -> 2 (re-voxelize to regenerate xml)
+      pr2 only                          -> 2 (voxelize)
+      nothing                           -> 1 (full run)
+
     Returns
     -------
-    int : step number to start from (1-7). Steps before this are already complete.
+    int : step number to start from (1-7).
     """
-    csv_path = patient_out_dir / f"{patient_id}_fluid_data.csv"
+    csv_path     = patient_out_dir / f"{patient_id}_fluid_data.csv"
+    raw_xml_path = RAW_DIR / f"{patient_id}_input.xml"
 
+    # CSV exists: validate completeness (10 blocks for 20000 steps / period 2000)
     if csv_path.exists():
-        return 7   # CSV exists: skip to quality checks
-    if (patient_out_dir / "Extracted" / "whole.xtr").exists() or        list(patient_out_dir.glob("**/whole.xtr")):
-        return 6   # .xtr exists: skip to CSV extraction
-    if patient_out_dir.exists() and any(patient_out_dir.iterdir()):
-        return 5   # Output dir has content: simulation already ran, something went wrong
+        try:
+            with open(csv_path, 'r') as fh:
+                ts_count = fh.read().count('# Timestep')
+            if ts_count >= 10:
+                return 7
+            logging.warning(
+                f"  {patient_id}: CSV incomplete ({ts_count}/10 timestep blocks). "
+                f"Deleting and rerunning."
+            )
+        except Exception as e:
+            logging.warning(f"  {patient_id}: CSV validation error ({e}). Deleting and rerunning.")
+        csv_path.unlink(missing_ok=True)
+        if patient_out_dir.exists():
+            shutil.rmtree(patient_out_dir)
+
+    # Output dir exists but no CSV: interrupted mid-simulation or mid-extraction
+    if patient_out_dir.exists():
+        logging.warning(
+            f"  {patient_id}: partial output directory found (no CSV). "
+            f"Deleting and rerunning simulation."
+        )
+        shutil.rmtree(patient_out_dir)
+
+    # Patched XML + GMY: ready to simulate (step 5)
     if patient_xml.exists() and patient_gmy.exists():
-        return 5   # GMY + XML ready: skip to simulation
+        return 5
+
+    # Raw XML from hlb-gmy-cli in RAW_DIR + GMY: ready to patch XML (step 3)
+    if raw_xml_path.exists() and patient_gmy.exists():
+        return 3
+
+    # GMY exists but no XML anywhere: re-voxelize to regenerate XML
+    # Happens when XMLs were deleted but GMY files preserved (e.g. BC type switch)
     if patient_gmy.exists():
-        return 3   # GMY exists: skip to XML patching
+        logging.info(
+            f"  {patient_id}: GMY found but no XML. "
+            f"Re-voxelizing to regenerate XML (~8s at 0.2mm)."
+        )
+        return 2
+
+    # PR2 exists: skip PR2 generation, go to voxelization
     if patient_pr2.exists():
-        return 2   # PR2 exists: skip to voxelization
-    return 1       # Start from scratch
+        return 2
+
+    # Nothing exists: full run from scratch
+    return 1
 
 
 def process_patient(mesh_file, start_from=None):
@@ -844,21 +899,63 @@ def process_patient(mesh_file, start_from=None):
         tree = ET.parse(generated_xml_path)
         root = tree.getroot()
 
+        # 3a. Absolute GMY path
         datafile = root.find(".//geometry/datafile")
         if datafile is not None:
             datafile.set("path", str(patient_gmy.resolve()))
 
+        # 3b. Simulation steps
         steps_element = root.find(".//simulation/steps")
         if steps_element is not None:
             steps_element.set("value", "20000")
 
+        # 3c. Properties extraction block
         properties = root.find("properties")
         if properties is None:
             properties  = ET.SubElement(root, "properties")
-            prop_output = ET.SubElement(properties, "propertyoutput", {"file": "whole.xtr", "period": "2000"})
+            prop_output = ET.SubElement(properties, "propertyoutput",
+                                        {"file": "whole.xtr", "period": "2000"})
             ET.SubElement(prop_output, "geometry", {"type": "whole"})
             ET.SubElement(prop_output, "field",    {"type": "velocity"})
             ET.SubElement(prop_output, "field",    {"type": "pressure"})
+
+        # 3d. Replace inlet pressure BC with velocity parabolic BC
+        #     The pr2 uses pressure syntax for hlb-gmy-cli compatibility only.
+        #     Velocity parabolic is the scientifically correct BC (published HemeLB standard).
+        iolets_info  = parse_pr2_iolets(patient_pr2)
+        inlet_info   = next((io for io in iolets_info if io['type'] == 'Inlet'), None)
+        if inlet_info is None:
+            raise ValueError(f"No Inlet found in {patient_pr2}. Cannot set velocity BC.")
+
+        inlet_radius_m = inlet_info['radius'] / 1000.0  # mm -> m
+        logging.info(
+            f"  Setting velocity parabolic inlet: "
+            f"radius={inlet_radius_m*1000:.3f} mm, "
+            f"v_max={INLET_MAX_VELOCITY} m/s, "
+            f"v_mean={INLET_MAX_VELOCITY/2:.4f} m/s"
+        )
+
+        for inlet_elem in root.findall(".//inlets/inlet"):
+            # Remove existing condition (pressure cosine from hlb-gmy-cli)
+            old_cond = inlet_elem.find("condition")
+            if old_cond is not None:
+                inlet_elem.remove(old_cond)
+
+            # Build velocity parabolic condition
+            new_cond = ET.Element("condition")
+            new_cond.set("type", "velocity")
+            new_cond.set("subtype", "parabolic")
+
+            radius_el = ET.SubElement(new_cond, "radius")
+            radius_el.set("value", f"{inlet_radius_m:.8f}")
+            radius_el.set("units", "m")
+
+            maxvel_el = ET.SubElement(new_cond, "maximum")
+            maxvel_el.set("value", f"{INLET_MAX_VELOCITY:.4f}")
+            maxvel_el.set("units", "m/s")
+
+            # Insert as first child of <inlet>
+            inlet_elem.insert(0, new_cond)
 
         tree.write(patient_xml, encoding="utf-8", xml_declaration=True)
 
@@ -866,22 +963,21 @@ def process_patient(mesh_file, start_from=None):
         if generated_xml_path.exists():
             os.remove(generated_xml_path)
 
+        # Diagnostic: print the patched XML
+        try:
+            with open(patient_xml, 'r') as fh:
+                logging.info(
+                    f"\n{'='*50}\n--- DIAGNOSTIC: PATCHED XML ---\n{'='*50}\n"
+                    f"{fh.read()}\n{'='*50}"
+                )
+        except Exception as e:
+            logging.error(f"Could not read XML for diagnostic: {e}")
+
     # STEP 4: Purge stale output directory (only on full reruns)
     if step <= 4:
         if patient_out_dir.exists():
             logging.info(f"  Purging stale output directory: {patient_out_dir.name}")
             shutil.rmtree(patient_out_dir)
-
-    # DIAGNOSTIC: Print XML
-    if step <= 4:
-        try:
-            with open(patient_xml, 'r') as f:
-                logging.info(
-                    f"\n{'='*50}\n--- DIAGNOSTIC: GENERATED XML ---\n{'='*50}\n"
-                    f"{f.read()}\n{'='*50}"
-                )
-        except Exception as e:
-            logging.error(f"Could not read XML for diagnostic: {e}")
 
     # STEP 5: Run HemeLB simulation
     if step <= 5:
@@ -927,9 +1023,10 @@ def process_patient(mesh_file, start_from=None):
         raise SimulationQualityError(f"Mass conservation check failed with exception for {patient_id}.") from e
 
     if not mass_passed:
-        logging.warning(
-            f"  Mass conservation metric logged but not used for exclusion: "
-            f"rel_error={rel_error:.4e}"
+        log_exclusion(patient_id, "mass_not_conserved", "rel_flux_imbalance", rel_error)
+        raise SimulationQualityError(
+            f"{patient_id} excluded: mass not conserved "
+            f"(rel_error={rel_error:.4e} > threshold={MASS_CONSERVATION_THRESHOLD})."
         )
 
     logging.info(f"============ Case {patient_id}: All checks PASSED ============\n")
