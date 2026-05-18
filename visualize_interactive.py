@@ -2,28 +2,50 @@
 """
 visualize_interactive.py
 
-Interactive 3D visualization of WSS and flow data using PyVista.
-Full zoom, rotate, pan, clip planes, and timestep scrubbing.
+Research-standard interactive 3D visualization of WSS and hemodynamic flow data.
+Built on PyVista (VTK/OpenGL) for hardware-accelerated rendering.
 
-Install dependencies:
-    pip install pyvista pyvistaqt
+Install
+-------
+    pip install pyvista
 
 Usage
 -----
-    python visualize_interactive.py C0001       # WSS view
-    python visualize_interactive.py C0001 flow  # Flow animation with slider
-    python visualize_interactive.py C0001 C0005 # Side-by-side WSS comparison
+    python visualize_interactive.py C0001              # WSS surface view
+    python visualize_interactive.py C0001 C0005        # Side-by-side WSS comparison
+    python visualize_interactive.py C0001 flow         # Flow with timestep slider
+    python visualize_interactive.py C0001 C0005 flow   # Side-by-side flow comparison
 
-Controls (PyVista window)
--------------------------
-    Left-click drag   : rotate
-    Right-click drag  : zoom
-    Middle-click drag : pan
-    Scroll wheel      : zoom in/out
-    r                 : reset camera
-    s                 : surface rendering
-    w                 : wireframe rendering
-    q                 : quit
+Controls (all modes)
+--------------------
+    Scroll wheel        : zoom in/out
+    Left-click drag     : rotate
+    Middle-click drag   : pan
+    Right-click drag    : zoom (fine)
+    r                   : reset camera
+    c                   : clip plane (interactive cross-section)
+    p                   : save screenshot to screenshots/
+    f                   : focus on picked point
+    q / Escape          : quit
+
+WSS mode buttons (top-left)
+----------------------------
+    WSS (Pa)    : absolute WSS magnitude
+    nWSS        : normalised WSS (WSS / case mean) - pressure independent
+    log(WSS)    : log-scale WSS - reveals low-magnitude spatial structure
+    Low-WSS     : binary mask of low-WSS zone (< 0.4 Pa)
+    Focus Peak  : snap camera to peak WSS impingement point
+
+Research outputs per case
+--------------------------
+    - WSS magnitude surface coloured blue (low) to red (high)
+    - Normalised WSS (nWSS = WSS/mean): velocity-independent, cross-case comparable
+    - Low-WSS zone overlay: chronic low-WSS region associated with rupture risk
+    - Impingement marker: yellow sphere at peak WSS location
+    - Full statistics panel: mean, median, max, std, low/high WSS fractions, nWSS range
+    - Clinical threshold annotations: 0.4 Pa (low) and 2.5 Pa (high)
+    - Zoom slider on right edge
+    - Camera orientation cube
 """
 
 import sys
@@ -35,31 +57,33 @@ import pyvista as pv
 from scipy.spatial import KDTree
 from pathlib import Path
 
-BASE_DIR    = Path(__file__).parent
-RAW_DIR     = BASE_DIR / "data/raw_meshes"
-WSS_DIR     = BASE_DIR / "data/wss"
-OUT_DIR     = BASE_DIR / "data/outputs_csv"
-MANIFEST    = BASE_DIR / "data/dataset_manifest.csv"
+BASE_DIR       = Path(__file__).parent
+RAW_DIR        = BASE_DIR / "data/raw_meshes"
+WSS_DIR        = BASE_DIR / "data/wss"
+OUT_DIR        = BASE_DIR / "data/outputs_csv"
+MANIFEST       = BASE_DIR / "data/dataset_manifest.csv"
+SCREENSHOT_DIR = BASE_DIR / "screenshots"
+SCREENSHOT_DIR.mkdir(exist_ok=True)
 
 NUM_PATTERN = re.compile(r'[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?')
 
-# Clinical thresholds
-LOW_WSS     = 0.4    # Pa
-HIGH_WSS    = 2.5    # Pa
+LOW_WSS  = 0.4
+HIGH_WSS = 2.5
+WSS_CMAP  = 'RdBu_r'
+FLOW_CMAP = 'plasma'
 
-# PyVista theme
 pv.set_plot_theme("dark")
 
 
-# ── Data loaders ──────────────────────────────────────────────────────────────
+# ── Manifest ──────────────────────────────────────────────────────────────────
 
 def load_manifest():
     if not MANIFEST.exists():
         return {}
-    import csv
+    import csv as _csv
     info = {}
     with open(MANIFEST, newline='') as f:
-        for row in csv.DictReader(f):
+        for row in _csv.DictReader(f):
             pid = row.get('patient_id', '')
             info[pid] = {
                 'status'  : row.get('ruptureStatus', ''),
@@ -70,209 +94,268 @@ def load_manifest():
     return info
 
 
+def patient_label(pid, info):
+    status = 'RUPTURED' if info.get('status') == 'R' else 'Unruptured'
+    return status, info.get('location',''), info.get('age',''), info.get('sex','')
+
+
+# ── Data loaders ──────────────────────────────────────────────────────────────
+
 def load_wss_csv(patient_id):
     path = WSS_DIR / f"{patient_id}_wss.csv"
     if not path.exists():
-        raise FileNotFoundError(f"WSS file not found: {path}. Run compute_wss.py first.")
+        raise FileNotFoundError(f"WSS not found: {path}. Run compute_wss.py first.")
     df = pd.read_csv(path)
     return df[['x', 'y', 'z']].values, df['wss_magnitude'].values
 
 
 def load_stl_as_pyvista(patient_id):
-    """Load STL and return as PyVista PolyData with vertices in metres."""
     stl_path = RAW_DIR / f"{patient_id}.stl"
     if not stl_path.exists():
         raise FileNotFoundError(f"STL not found: {stl_path}")
-    mesh_tm   = trimesh.load(stl_path, force='mesh')
-    verts_m   = mesh_tm.vertices * 0.001   # mm -> m
-    faces     = mesh_tm.faces
-
-    # PyVista face format: [3, v0, v1, v2, 3, v0, v1, v2, ...]
-    pv_faces  = np.hstack([np.full((len(faces), 1), 3), faces]).ravel()
-    mesh_pv   = pv.PolyData(verts_m, pv_faces)
-    return mesh_pv
+    tm       = trimesh.load(stl_path, force='mesh')
+    verts_m  = tm.vertices * 0.001
+    pv_faces = np.hstack([np.full((len(tm.faces), 1), 3), tm.faces]).ravel()
+    return pv.PolyData(verts_m, pv_faces)
 
 
-def map_wss_to_mesh(mesh_pv, wss_xyz, wss_values):
-    """KDTree map WSS from fluid nodes to mesh vertices."""
-    tree       = KDTree(wss_xyz)
-    _, nn_idx  = tree.query(mesh_pv.points)
-    vertex_wss = wss_values[nn_idx]
-    mesh_pv.point_data['WSS_Pa']      = vertex_wss
-    mesh_pv.point_data['WSS_log']     = np.log10(np.clip(vertex_wss, 1e-6, None))
-    mesh_pv.point_data['LowWSS_mask'] = (vertex_wss < LOW_WSS).astype(float)
+def map_wss_to_mesh(mesh_pv, wss_xyz, wss_vals):
+    tree      = KDTree(wss_xyz)
+    _, nn_idx = tree.query(mesh_pv.points)
+    vwss      = wss_vals[nn_idx]
+    nwss      = vwss / (vwss.mean() + 1e-12)
+    mesh_pv.point_data['WSS_Pa']      = vwss
+    mesh_pv.point_data['nWSS']        = nwss
+    mesh_pv.point_data['WSS_log']     = np.log10(np.clip(vwss, 1e-6, None))
+    mesh_pv.point_data['LowWSS_mask'] = (vwss < LOW_WSS).astype(float)
     return mesh_pv
 
 
 def parse_all_timesteps(patient_id):
-    """Parse all timestep blocks from the fluid CSV."""
-    csv_matches = list((OUT_DIR / patient_id).glob(f"{patient_id}_fluid_data.csv"))
-    if not csv_matches:
+    csv_list = list((OUT_DIR / patient_id).glob(f"{patient_id}_fluid_data.csv"))
+    if not csv_list:
         raise FileNotFoundError(f"No CSV for {patient_id}")
-
-    with open(csv_matches[0], 'r') as f:
+    with open(csv_list[0], 'r') as f:
         lines = f.readlines()
-
-    origin = None
-    voxel_size = None
-    ts_indices = []
-
+    origin, voxel_size, ts_indices = None, None, []
     for i, line in enumerate(lines):
         if line.startswith('# Geometry origin'):
-            nums   = NUM_PATTERN.findall(line)
-            origin = np.array([float(n) for n in nums[:3]])
+            origin = np.array([float(n) for n in NUM_PATTERN.findall(line)[:3]])
         elif line.startswith('# Voxel size'):
             voxel_size = float(NUM_PATTERN.findall(line)[0])
         elif line.startswith('# Timestep'):
-            ts_num = int(NUM_PATTERN.findall(line)[0])
-            ts_indices.append((i, ts_num))
-
+            ts_indices.append((i, int(NUM_PATTERN.findall(line)[0])))
     result = []
-    for block_idx, (line_idx, ts_num) in enumerate(ts_indices):
-        end_idx    = ts_indices[block_idx + 1][0] if block_idx + 1 < len(ts_indices) else len(lines)
-        data_lines = [
-            l.strip() for l in lines[line_idx + 1:end_idx]
-            if l.strip() and not l.strip().startswith('#')
-        ]
-        grid_list = []
-        vel_list  = []
-        pres_list = []
-        for line in data_lines:
-            nums = [float(x) for x in NUM_PATTERN.findall(line)]
+    for bi, (li, ts_num) in enumerate(ts_indices):
+        end  = ts_indices[bi+1][0] if bi+1 < len(ts_indices) else len(lines)
+        rows = [l.strip() for l in lines[li+1:end]
+                if l.strip() and not l.strip().startswith('#')]
+        gl, vl, pl_ = [], [], []
+        for row in rows:
+            nums = [float(x) for x in NUM_PATTERN.findall(row)]
             if len(nums) == 7:
-                grid_list.append(nums[0:3])
-                vel_list.append(nums[3:6])
-                pres_list.append(nums[6])
-
-        grid = np.array(grid_list, dtype=np.int32)
-        xyz  = origin + grid.astype(np.float64) * voxel_size
-        vel  = np.array(vel_list, dtype=np.float64)
-        mag  = np.linalg.norm(vel, axis=1)
-        pres = np.array(pres_list, dtype=np.float64)
-
-        result.append({
-            'timestep' : ts_num,
-            'time_s'   : ts_num * 1e-5,
-            'xyz'      : xyz,
-            'velocity' : vel,
-            'speed'    : mag,
-            'pressure' : pres,
-        })
-
-    print(f"  {patient_id}: {len(result)} timesteps, "
-          f"{len(result[0]['xyz']):,} fluid sites")
+                gl.append(nums[:3]); vl.append(nums[3:6]); pl_.append(nums[6])
+        g   = np.array(gl, dtype=np.int32)
+        xyz = origin + g.astype(np.float64) * voxel_size
+        vel = np.array(vl, dtype=np.float64)
+        result.append({'timestep': ts_num, 'time_s': ts_num*1e-5,
+                       'xyz': xyz, 'velocity': vel,
+                       'speed': np.linalg.norm(vel, axis=1),
+                       'pressure': np.array(pl_, dtype=np.float64)})
+    print(f"  {patient_id}: {len(result)} timesteps, {len(result[0]['xyz']):,} sites")
     return result, origin, voxel_size
 
 
-# ── View modes ────────────────────────────────────────────────────────────────
+# ── Shared UI components ──────────────────────────────────────────────────────
+
+def add_zoom_slider(pl):
+    zoom_state = {'factor': 1.0}
+    def zoom_cb(value):
+        ratio = float(value) / zoom_state['factor']
+        pl.camera.zoom(ratio)
+        zoom_state['factor'] = float(value)
+    pl.add_slider_widget(
+        callback=zoom_cb, rng=[0.2, 8.0], value=1.0,
+        title='Zoom',
+        pointa=(0.935, 0.18), pointb=(0.935, 0.82),
+        style='modern', color='#aaaaaa', title_color='white',
+        title_height=0.014, fmt='%.1fx',
+        slider_width=0.014, tube_width=0.004,
+    )
+
+
+def add_screenshot_key(pl, prefix='screenshot'):
+    counter = {'n': 0}
+    def cb():
+        counter['n'] += 1
+        path = SCREENSHOT_DIR / f"{prefix}_{counter['n']:03d}.png"
+        pl.screenshot(str(path))
+        print(f"  Screenshot: {path}")
+    pl.add_key_event('p', cb)
+
+
+def add_stats_text(pl, pid, wss_vals, status, loc, age, sex):
+    nwss      = wss_vals / (wss_vals.mean() + 1e-12)
+    pct_low   = 100 * (wss_vals < LOW_WSS).mean()
+    pct_high  = 100 * (wss_vals > HIGH_WSS).mean()
+    pl.add_text(
+        f"{pid}  |  {status}  |  {loc}\n"
+        f"Age: {age}   Sex: {sex}\n"
+        f"{'─'*26}\n"
+        f"WSS mean   : {wss_vals.mean():.3f} Pa\n"
+        f"WSS median : {np.median(wss_vals):.3f} Pa\n"
+        f"WSS max    : {wss_vals.max():.2f} Pa\n"
+        f"WSS std    : {wss_vals.std():.3f} Pa\n"
+        f"{'─'*26}\n"
+        f"Low  WSS (<{LOW_WSS}Pa): {pct_low:.1f}%\n"
+        f"High WSS (>{HIGH_WSS}Pa): {pct_high:.1f}%\n"
+        f"nWSS range: {nwss.min():.2f} – {nwss.max():.2f}",
+        position='upper_left', font_size=8, color='white', font='courier',
+    )
+
+
+def add_impingement_marker(pl, mesh_pv, wss_vals):
+    peak_idx   = np.argmax(mesh_pv.point_data['WSS_Pa'])
+    peak_coord = mesh_pv.points[peak_idx]
+    sphere     = pv.Sphere(radius=0.0008, center=peak_coord)
+    pl.add_mesh(sphere, color='yellow', opacity=1.0)
+    pl.add_point_labels(
+        [peak_coord], [f"Peak WSS\n{wss_vals.max():.2f} Pa"],
+        font_size=9, text_color='yellow',
+        shape_color='black', shape_opacity=0.5, show_points=False,
+    )
+    return peak_coord
+
+
+# ── WSS view ──────────────────────────────────────────────────────────────────
 
 def view_wss(patient_ids):
-    """
-    Side-by-side WSS surface view with clip plane widget.
-    Fully interactive: zoom, rotate, clip plane for cross-sections.
-    """
     manifest = load_manifest()
     n        = len(patient_ids)
-    pl       = pv.Plotter(shape=(1, n), window_size=[900 * n, 750])
+    pl       = pv.Plotter(shape=(1, n), window_size=[1000*n, 840])
 
     for col, pid in enumerate(patient_ids):
         pl.subplot(0, col)
-
-        info   = manifest.get(pid, {})
-        status = 'RUPTURED' if info.get('status') == 'R' else 'Unruptured'
-        loc    = info.get('location', '')
-        age    = info.get('age', '')
-        sex    = info.get('sex', '')
+        info                  = manifest.get(pid, {})
+        status, loc, age, sex = patient_label(pid, info)
 
         print(f"\nLoading {pid} ({status}, {loc})...")
         wss_xyz, wss_vals = load_wss_csv(pid)
         mesh_pv           = load_stl_as_pyvista(pid)
         mesh_pv           = map_wss_to_mesh(mesh_pv, wss_xyz, wss_vals)
+        mesh_pv           = mesh_pv.smooth(n_iter=30, relaxation_factor=0.1)
 
-        # Smooth the mesh slightly for better visual
-        mesh_pv = mesh_pv.smooth(n_iter=20, relaxation_factor=0.1)
+        vmax_pa   = np.percentile(wss_vals, 97)
+        vmax_nwss = np.percentile(mesh_pv.point_data['nWSS'], 97)
 
-        vmax = np.percentile(wss_vals, 97)
-
+        # Primary WSS surface
         pl.add_mesh(
-            mesh_pv,
-            scalars='WSS_Pa',
-            cmap='RdBu_r',
-            clim=[0, vmax],
-            smooth_shading=True,
-            show_scalar_bar=False,
+            mesh_pv, scalars='WSS_Pa', cmap=WSS_CMAP,
+            clim=[0.0, vmax_pa], smooth_shading=True,
+            show_scalar_bar=True,
+            scalar_bar_args={
+                'title': 'WSS (Pa)', 'color': 'white',
+                'title_font_size': 13, 'label_font_size': 11,
+                'n_labels': 6, 'fmt': '%.2f',
+                'position_x': 0.05, 'position_y': 0.06,
+                'width': 0.32, 'height': 0.055,
+            },
+            name='wss_surface',
         )
 
-        # Scalar bar
-        pl.add_scalar_bar(
-            title='WSS (Pa)',
-            n_labels=5,
-            fmt='%.2f',
-            position_x=0.05,
-            position_y=0.05,
-            width=0.4,
-            height=0.08,
-            title_font_size=12,
-            label_font_size=10,
-            color='white',
-        )
+        # Low-WSS overlay
+        low_region = mesh_pv.threshold(value=[0.0, LOW_WSS], scalars='WSS_Pa')
+        if low_region.n_points > 0:
+            pl.add_mesh(low_region, color='#00cfff', opacity=0.4,
+                        show_edges=False, name='low_wss_overlay')
 
-        # Add threshold contour for low WSS zone
-        low_wss_region = mesh_pv.threshold(
-            value=[0, LOW_WSS],
-            scalars='WSS_Pa',
-            invert=False
-        )
-        if low_wss_region.n_points > 0:
-            pl.add_mesh(
-                low_wss_region,
-                color='#00bfff',
-                opacity=0.3,
-                label=f'Low WSS < {LOW_WSS} Pa',
-                show_edges=False,
+        # Impingement marker
+        peak_coord = add_impingement_marker(pl, mesh_pv, wss_vals)
+
+        # Stats
+        add_stats_text(pl, pid, wss_vals, status, loc, age, sex)
+
+        # Orientation cube + zoom slider + screenshot
+        pl.add_camera_orientation_widget()
+        add_zoom_slider(pl)
+        add_screenshot_key(pl, prefix=f"wss_{pid}")
+        pl.add_axes(color='white', xlabel='X', ylabel='Y', zlabel='Z')
+
+        # ── Toggle buttons ────────────────────────────────────────────────────
+        win_h = pl.window_size[1]
+        y0    = 0.80
+        bh    = 0.058
+        bsize = 24
+
+        def _make_scalar_cb(scalar, vmin, vmax, _pl=pl, _mesh=mesh_pv):
+            def cb(_state):
+                _pl.update_scalars(scalar, mesh=_mesh, render=False)
+                _pl.update_scalar_bar_range([vmin, vmax])
+                _pl.render()
+            return cb
+
+        log_min = float(mesh_pv.point_data['WSS_log'].min())
+        log_max = float(mesh_pv.point_data['WSS_log'].max())
+
+        buttons = [
+            ('WSS (Pa)',  '#e74c3c', _make_scalar_cb('WSS_Pa',      0,       vmax_pa)),
+            ('nWSS',      '#3498db', _make_scalar_cb('nWSS',         0,       vmax_nwss)),
+            ('log(WSS)',  '#2ecc71', _make_scalar_cb('WSS_log',      log_min, log_max)),
+            ('Low-WSS',   '#00cfff', _make_scalar_cb('LowWSS_mask',  0,       1)),
+        ]
+
+        for i, (label, colour, cb) in enumerate(buttons):
+            ypos = int(win_h * (y0 - i * bh))
+            pl.add_checkbox_button_widget(
+                cb, value=(i == 0),
+                position=(10, ypos), size=bsize,
+                color_on=colour, color_off='#444444',
             )
+            pl.add_text(label, position=(42, ypos + 4),
+                        font_size=8, color='white')
 
-        # Stats text
-        n_low  = (wss_vals < LOW_WSS).sum()
-        pct    = 100 * n_low / len(wss_vals)
-        pl.add_text(
-            f"{pid}  [{status} | {loc}]\n"
-            f"Age: {age}  Sex: {sex}\n"
-            f"mean WSS: {wss_vals.mean():.2f} Pa\n"
-            f"max WSS: {wss_vals.max():.2f} Pa\n"
-            f"Low-WSS nodes: {pct:.1f}%",
-            position='upper_left',
-            font_size=9,
-            color='white',
+        # Focus aneurysm button
+        def focus_cb(_state, _pl=pl, _coord=peak_coord, _mesh=mesh_pv):
+            b = _mesh.bounds
+            span = max(b[1]-b[0], b[3]-b[2], b[5]-b[4])
+            _pl.camera.focal_point = _coord.tolist()
+            _pl.camera.position    = (_coord + np.array([0, 0, span*0.35])).tolist()
+            _pl.camera.zoom(3.0)
+            _pl.render()
+
+        ypos_focus = int(win_h * (y0 - len(buttons) * bh))
+        pl.add_checkbox_button_widget(
+            focus_cb, value=False,
+            position=(10, ypos_focus), size=bsize,
+            color_on='#f39c12', color_off='#444444',
         )
+        pl.add_text('Focus Peak', position=(42, ypos_focus + 4),
+                    font_size=8, color='white')
 
-        pl.add_axes(color='white')
-
-    pl.link_views()   # sync camera across subplots
+    pl.link_views()
     pl.add_title(
-        "WSS Distribution — Use scroll to zoom, drag to rotate, "
-        "right-click drag to pan",
-        font_size=9, color='white'
+        "WSS  |  Scroll=zoom  Drag=rotate  'c'=clip  'p'=screenshot  "
+        "Buttons: scalar toggle  Right slider: zoom",
+        font_size=8, color='#999999',
     )
-    print("\nInteractive WSS viewer ready.")
-    print("Tip: Press 'c' to activate clip plane for cross-section view.")
+    print("\nWSS viewer ready.")
+    print("  Top-left buttons: WSS(Pa) | nWSS | log(WSS) | Low-WSS | Focus Peak")
+    print("  Right edge: zoom slider")
+    print("  'c' key: clip plane for cross-sections")
+    print("  'p' key: save screenshot")
     pl.show(cpos='iso')
 
 
-def view_flow(patient_id, subsample=30):
-    """
-    Interactive flow viewer with timestep slider.
-    Shows velocity magnitude on fluid nodes with a scrub bar.
-    """
-    manifest = load_manifest()
-    info     = manifest.get(patient_id, {})
-    status   = 'RUPTURED' if info.get('status') == 'R' else 'Unruptured'
-    loc      = info.get('location', '')
+# ── Flow view ─────────────────────────────────────────────────────────────────
 
-    print(f"\nLoading all timesteps for {patient_id}...")
+def view_flow(patient_id, subsample=25):
+    manifest              = load_manifest()
+    info                  = manifest.get(patient_id, {})
+    status, loc, age, sex = patient_label(patient_id, info)
+
+    print(f"\nLoading timesteps for {patient_id}...")
     ts_data, origin, voxel_size = parse_all_timesteps(patient_id)
 
-    # Load WSS for final timestep overlay
     try:
         wss_xyz, wss_vals = load_wss_csv(patient_id)
         mesh_pv           = load_stl_as_pyvista(patient_id)
@@ -282,141 +365,147 @@ def view_flow(patient_id, subsample=30):
         has_wss = False
         mesh_pv = None
 
-    # Shared velocity scale
-    all_speeds = np.concatenate([d['speed'] for d in ts_data])
-    vmax       = np.percentile(all_speeds, 97)
-    vmin       = 0.0
+    all_spd  = np.concatenate([d['speed']    for d in ts_data])
+    all_pres = np.concatenate([d['pressure'] for d in ts_data])
+    vmax_spd  = np.percentile(all_spd, 97)
+    vmin_pres = np.percentile(all_pres, 3)
+    vmax_pres = np.percentile(all_pres, 97)
 
-    pl = pv.Plotter(window_size=[1100, 800])
+    pl = pv.Plotter(window_size=[1250, 860])
 
-    # Add vessel surface (semi-transparent WSS overlay)
     if has_wss:
         wss_vmax = np.percentile(wss_vals, 97)
-        pl.add_mesh(
-            mesh_pv,
-            scalars='WSS_Pa',
-            cmap='RdBu_r',
-            clim=[0, wss_vmax],
-            opacity=0.25,
-            smooth_shading=True,
-            show_scalar_bar=False,
-            name='vessel_surface',
-        )
+        pl.add_mesh(mesh_pv, scalars='WSS_Pa', cmap=WSS_CMAP,
+                    clim=[0, wss_vmax], opacity=0.18,
+                    smooth_shading=True, show_scalar_bar=False,
+                    name='vessel_surface')
 
-    # Initial fluid point cloud
-    ts0   = ts_data[-1]   # Start at final (converged) timestep
+    ts0   = ts_data[-1]
     idx_s = np.arange(0, len(ts0['xyz']), subsample)
     pc0   = pv.PolyData(ts0['xyz'][idx_s])
-    pc0['speed'] = ts0['speed'][idx_s]
-    pc0['vx']    = ts0['velocity'][idx_s, 0]
-    pc0['vy']    = ts0['velocity'][idx_s, 1]
-    pc0['vz']    = ts0['velocity'][idx_s, 2]
+    pc0['speed']    = ts0['speed'][idx_s]
+    pc0['pressure'] = ts0['pressure'][idx_s]
+    pc0['vx']       = ts0['velocity'][idx_s, 0]
+    pc0['vy']       = ts0['velocity'][idx_s, 1]
+    pc0['vz']       = ts0['velocity'][idx_s, 2]
 
-    pl.add_mesh(
-        pc0,
-        scalars='speed',
-        cmap='plasma',
-        clim=[vmin, vmax],
-        point_size=3,
-        render_points_as_spheres=True,
-        show_scalar_bar=True,
-        scalar_bar_args={
-            'title'         : 'Speed (m/s)',
-            'color'         : 'white',
-            'title_font_size': 12,
-            'label_font_size': 10,
-        },
-        name='fluid_nodes',
-    )
+    pl.add_mesh(pc0, scalars='speed', cmap=FLOW_CMAP,
+                clim=[0, vmax_spd], point_size=3,
+                render_points_as_spheres=True, show_scalar_bar=True,
+                scalar_bar_args={'title': 'Speed (m/s)', 'color': 'white',
+                                 'title_font_size': 12, 'label_font_size': 10,
+                                 'position_x': 0.05, 'position_y': 0.06,
+                                 'width': 0.32, 'height': 0.055},
+                name='fluid_nodes')
 
-    # ── Timestep slider ───────────────────────────────────────────────────────
-    ts_labels = [f"Step {d['timestep']}  t={d['time_s']:.4f}s"
-                 for d in ts_data]
+    def info_str(ts):
+        return (f"{patient_id}  [{status} | {loc}]  Age:{age}  Sex:{sex}\n"
+                f"Step {ts['timestep']}  t={ts['time_s']:.4f}s\n"
+                f"Speed  mean={ts['speed'].mean():.4f}  max={ts['speed'].max():.4f} m/s\n"
+                f"Press  mean={ts['pressure'].mean():.4e} Pa")
 
-    info_text = pl.add_text(
-        f"{patient_id} [{status} | {loc}] | "
-        f"Step {ts0['timestep']}  t={ts0['time_s']:.4f}s\n"
-        f"mean speed: {ts0['speed'].mean():.4f} m/s  "
-        f"max speed: {ts0['speed'].max():.4f} m/s",
-        position='upper_left',
-        font_size=9,
-        color='white',
-        name='info_text',
-    )
+    pl.add_text(info_str(ts0), position='upper_left',
+                font_size=8, color='white', font='courier', name='info')
 
-    def update_timestep(value):
-        # Find nearest timestep index
-        idx   = int(round(value))
-        idx   = max(0, min(idx, len(ts_data) - 1))
+    show_state   = {'scalar': 'speed', 'arrows': False}
+    arrows_actor = {'obj': None}
+
+    def update_ts(value):
+        idx   = max(0, min(int(round(value)), len(ts_data)-1))
         ts    = ts_data[idx]
-
         idx_s = np.arange(0, len(ts['xyz']), subsample)
         pc    = pv.PolyData(ts['xyz'][idx_s])
-        pc['speed'] = ts['speed'][idx_s]
-
-        pl.add_mesh(
-            pc,
-            scalars='speed',
-            cmap='plasma',
-            clim=[vmin, vmax],
-            point_size=3,
-            render_points_as_spheres=True,
-            show_scalar_bar=False,
-            name='fluid_nodes',
-        )
-        pl.add_text(
-            f"{patient_id} [{status} | {loc}] | "
-            f"{ts_labels[idx]}\n"
-            f"mean speed: {ts['speed'].mean():.4f} m/s  "
-            f"max speed: {ts['speed'].max():.4f} m/s",
-            position='upper_left',
-            font_size=9,
-            color='white',
-            name='info_text',
-        )
+        pc['speed']    = ts['speed'][idx_s]
+        pc['pressure'] = ts['pressure'][idx_s]
+        sc    = show_state['scalar']
+        clim  = [0, vmax_spd] if sc == 'speed' else [vmin_pres, vmax_pres]
+        cmap  = FLOW_CMAP if sc == 'speed' else 'coolwarm'
+        pl.add_mesh(pc, scalars=sc, cmap=cmap, clim=clim,
+                    point_size=3, render_points_as_spheres=True,
+                    show_scalar_bar=False, name='fluid_nodes')
+        pl.add_text(info_str(ts), position='upper_left',
+                    font_size=8, color='white', font='courier', name='info')
+        if show_state['arrows']:
+            _refresh_arrows(ts, idx_s)
 
     pl.add_slider_widget(
-        callback=update_timestep,
-        rng=[0, len(ts_data) - 1],
-        value=len(ts_data) - 1,
+        callback=update_ts,
+        rng=[0, len(ts_data)-1], value=len(ts_data)-1,
         title='Timestep',
-        pointa=(0.1, 0.05),
-        pointb=(0.9, 0.05),
-        style='modern',
-        color='white',
-        title_color='white',
-        title_height=0.02,
-        fmt='%0.0f',
-        slider_width=0.02,
-        tube_width=0.005,
+        pointa=(0.10, 0.04), pointb=(0.88, 0.04),
+        style='modern', color='white', title_color='white',
+        title_height=0.018, fmt='%0.0f',
+        slider_width=0.018, tube_width=0.004,
     )
 
+    win_h = pl.window_size[1]
+    y0    = 0.80
+    bh    = 0.058
+    bsize = 24
+
+    def toggle_pressure(state):
+        show_state['scalar'] = 'pressure' if state else 'speed'
+        update_ts(len(ts_data)-1)
+
+    pl.add_checkbox_button_widget(toggle_pressure, value=False,
+        position=(10, int(win_h*y0)), size=bsize,
+        color_on='#9b59b6', color_off='#444444')
+    pl.add_text('Pressure', position=(42, int(win_h*y0)+4),
+                font_size=8, color='white')
+
+    def _refresh_arrows(ts, idx_s):
+        if arrows_actor['obj'] is not None:
+            pl.remove_actor(arrows_actor['obj'])
+        pc_a = pv.PolyData(ts['xyz'][idx_s])
+        pc_a['velocity'] = ts['velocity'][idx_s]
+        glyphs = pc_a.glyph(orient='velocity', scale='velocity',
+                             factor=0.002, geom=pv.Arrow(), tolerance=0.05)
+        arrows_actor['obj'] = pl.add_mesh(
+            glyphs, color='#ffff55', opacity=0.75, name='vel_arrows')
+
+    def toggle_arrows(state):
+        show_state['arrows'] = state
+        if not state and arrows_actor['obj'] is not None:
+            pl.remove_actor(arrows_actor['obj'])
+            arrows_actor['obj'] = None
+        elif state:
+            ts    = ts_data[-1]
+            idx_s = np.arange(0, len(ts['xyz']), subsample)
+            _refresh_arrows(ts, idx_s)
+
+    pl.add_checkbox_button_widget(toggle_arrows, value=False,
+        position=(10, int(win_h*(y0-bh))), size=bsize,
+        color_on='#f1c40f', color_off='#444444')
+    pl.add_text('Vel arrows', position=(42, int(win_h*(y0-bh))+4),
+                font_size=8, color='white')
+
+    pl.add_camera_orientation_widget()
+    add_zoom_slider(pl)
+    add_screenshot_key(pl, prefix=f"flow_{patient_id}")
     pl.add_axes(color='white')
     pl.add_title(
-        f"Flow Development: {patient_id} — Drag slider to scrub timesteps",
-        font_size=9, color='white'
-    )
+        f"Flow: {patient_id}  |  Slider=timestep  Buttons=Pressure/Arrows  "
+        f"Right=zoom  'p'=screenshot  'c'=clip",
+        font_size=8, color='#999999')
 
-    print("\nInteractive flow viewer ready.")
-    print("Drag the slider at the bottom to scrub through timesteps.")
-    print("Semi-transparent surface = WSS distribution (red=high, blue=low)")
+    print("\nFlow viewer ready.")
+    print("  Bottom slider: scrub through timesteps")
+    print("  Buttons: Pressure toggle | Velocity arrows")
+    print("  Right slider: zoom")
     pl.show(cpos='iso')
 
 
-def view_comparison_flow(pid1, pid2, subsample=30):
-    """Side-by-side flow comparison with shared timestep slider."""
-    manifest = load_manifest()
+# ── Flow comparison ───────────────────────────────────────────────────────────
 
-    print(f"\nLoading timesteps for {pid1} and {pid2}...")
+def view_comparison_flow(pid1, pid2, subsample=25):
+    manifest = load_manifest()
+    print(f"\nLoading {pid1} and {pid2}...")
     ts1, _, _ = parse_all_timesteps(pid1)
     ts2, _, _ = parse_all_timesteps(pid2)
 
-    all_speeds = np.concatenate(
-        [d['speed'] for d in ts1] + [d['speed'] for d in ts2]
-    )
-    vmax = np.percentile(all_speeds, 97)
+    all_spd = np.concatenate([d['speed'] for d in ts1+ts2])
+    vmax    = np.percentile(all_spd, 97)
 
-    # Load WSS meshes
     meshes = {}
     for pid in [pid1, pid2]:
         try:
@@ -425,94 +514,64 @@ def view_comparison_flow(pid1, pid2, subsample=30):
             mesh              = map_wss_to_mesh(mesh, wss_xyz, wss_vals)
             meshes[pid]       = (mesh, wss_vals)
         except FileNotFoundError:
-            meshes[pid] = (None, None)
+            meshes[pid]       = (None, None)
 
-    pl = pv.Plotter(shape=(1, 2), window_size=[1800, 800])
+    pl = pv.Plotter(shape=(1, 2), window_size=[1960, 860])
 
     for col, (pid, ts_data) in enumerate([(pid1, ts1), (pid2, ts2)]):
         pl.subplot(0, col)
-        info   = manifest.get(pid, {})
-        status = 'RUPTURED' if info.get('status') == 'R' else 'Unruptured'
-        loc    = info.get('location', '')
+        info                  = manifest.get(pid, {})
+        status, loc, age, sex = patient_label(pid, info)
+        mesh, wss_vals        = meshes[pid]
 
-        mesh, wss_vals = meshes[pid]
         if mesh is not None:
             wss_vmax = np.percentile(wss_vals, 97)
-            pl.add_mesh(
-                mesh,
-                scalars='WSS_Pa',
-                cmap='RdBu_r',
-                clim=[0, wss_vmax],
-                opacity=0.2,
-                smooth_shading=True,
-                show_scalar_bar=False,
-                name=f'surface_{pid}',
-            )
+            pl.add_mesh(mesh, scalars='WSS_Pa', cmap=WSS_CMAP,
+                        clim=[0, wss_vmax], opacity=0.18,
+                        smooth_shading=True, show_scalar_bar=False,
+                        name=f'surface_{pid}')
 
         ts    = ts_data[-1]
         idx_s = np.arange(0, len(ts['xyz']), subsample)
         pc    = pv.PolyData(ts['xyz'][idx_s])
         pc['speed'] = ts['speed'][idx_s]
 
-        pl.add_mesh(
-            pc,
-            scalars='speed',
-            cmap='plasma',
-            clim=[0, vmax],
-            point_size=3,
-            render_points_as_spheres=True,
-            show_scalar_bar=(col == 1),
-            scalar_bar_args={'title': 'Speed (m/s)', 'color': 'white'},
-            name=f'fluid_{pid}',
-        )
-        pl.add_text(
-            f"{pid}  [{status} | {loc}]",
-            position='upper_left',
-            font_size=10,
-            color='white',
-        )
+        pl.add_mesh(pc, scalars='speed', cmap=FLOW_CMAP, clim=[0, vmax],
+                    point_size=3, render_points_as_spheres=True,
+                    show_scalar_bar=(col == 1),
+                    scalar_bar_args={'title': 'Speed (m/s)', 'color': 'white'},
+                    name=f'fluid_{pid}')
+
+        pl.add_text(f"{pid}  [{status} | {loc}]\nAge:{age}  Sex:{sex}",
+                    position='upper_left', font_size=9, color='white')
+        pl.add_camera_orientation_widget()
+        add_zoom_slider(pl)
         pl.add_axes(color='white')
 
     pl.link_views()
+    add_screenshot_key(pl, prefix=f"cmp_{pid1}_{pid2}")
 
     def update_both(value):
-        idx = int(round(value))
-        idx = max(0, min(idx, len(ts1) - 1))
+        idx = max(0, min(int(round(value)), len(ts1)-1))
         for col, (pid, ts_data) in enumerate([(pid1, ts1), (pid2, ts2)]):
             pl.subplot(0, col)
             ts    = ts_data[idx]
             idx_s = np.arange(0, len(ts['xyz']), subsample)
             pc    = pv.PolyData(ts['xyz'][idx_s])
             pc['speed'] = ts['speed'][idx_s]
-            pl.add_mesh(
-                pc,
-                scalars='speed',
-                cmap='plasma',
-                clim=[0, vmax],
-                point_size=3,
-                render_points_as_spheres=True,
-                show_scalar_bar=False,
-                name=f'fluid_{pid}',
-            )
+            pl.add_mesh(pc, scalars='speed', cmap=FLOW_CMAP, clim=[0, vmax],
+                        point_size=3, render_points_as_spheres=True,
+                        show_scalar_bar=False, name=f'fluid_{pid}')
 
     pl.subplot(0, 0)
-    pl.add_slider_widget(
-        callback=update_both,
-        rng=[0, len(ts1) - 1],
-        value=len(ts1) - 1,
-        title='Timestep (both)',
-        pointa=(0.1, 0.04),
-        pointb=(0.9, 0.04),
-        style='modern',
-        color='white',
-        title_color='white',
-        fmt='%0.0f',
-    )
+    pl.add_slider_widget(update_both,
+        rng=[0, len(ts1)-1], value=len(ts1)-1,
+        title='Timestep (synced)',
+        pointa=(0.10, 0.04), pointb=(0.88, 0.04),
+        style='modern', color='white', title_color='white', fmt='%0.0f')
 
-    pl.add_title(
-        f"Flow Comparison: {pid1} vs {pid2} — Drag slider to scrub",
-        font_size=9, color='white'
-    )
+    pl.add_title(f"Flow: {pid1} vs {pid2}  |  Slider=timestep  'p'=screenshot",
+                 font_size=8, color='#999999')
     pl.show(cpos='iso')
 
 
@@ -522,11 +581,7 @@ if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith('-')]
 
     if len(args) == 0:
-        print("Usage:")
-        print("  python visualize_interactive.py C0001            # WSS view")
-        print("  python visualize_interactive.py C0001 flow       # Flow slider")
-        print("  python visualize_interactive.py C0001 C0005      # WSS comparison")
-        print("  python visualize_interactive.py C0001 C0005 flow # Flow comparison")
+        print(__doc__)
         sys.exit(0)
 
     mode = 'wss'
@@ -540,10 +595,10 @@ if __name__ == "__main__":
     if mode == 'flow':
         if len(pids) == 1:
             view_flow(pids[0])
-        elif len(pids) == 2:
+        elif len(pids) >= 2:
             view_comparison_flow(pids[0], pids[1])
         else:
-            print("Specify 1 or 2 patient IDs for flow mode.")
+            print("Specify 1 or 2 patient IDs.")
     else:
         if len(pids) >= 1:
             view_wss(pids[:2])
