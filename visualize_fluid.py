@@ -336,9 +336,9 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 # ==================================================================
 # CONFIGURATION - TUNE THESE FOR YOUR SURROGATE TRAINING ANALYSIS
 # ==================================================================
-CSV_PATH = Path("data/outputs_csv/model/model_fluid_data.csv")
-XML_PATH = Path("data/processed_gmy/model_input.xml")
-STL_PATH = Path("data/raw_meshes/model.stl")
+CSV_PATH = Path("data/outputs_csv/C0002/C0002_fluid_data.csv")
+XML_PATH = Path("data/processed_gmy/C0002_input.xml")
+STL_PATH = Path("data/raw_meshes/C0002.stl")
 
 SUBSAMPLE_RATE = 40       # Denser sampling (40) makes fluid patterns easier to trace
 ENABLE_CUTAWAY = True     # Slices the vessel in half lengthwise to reveal the interior

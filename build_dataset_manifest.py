@@ -33,7 +33,7 @@ logging.basicConfig(
 
 BASE_DIR     = Path(__file__).parent
 MODELS_DIR   = BASE_DIR / "AneuriskDatabase" / "models"
-RAW_DIR      = BASE_DIR / "data" / "raw_meshes_stl_backup"
+RAW_DIR      = BASE_DIR / "data" / "raw_meshes"
 DATA_DIR     = BASE_DIR / "data"
 OUTPUT_PATH  = DATA_DIR / "dataset_manifest.csv"
 
